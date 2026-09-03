@@ -275,6 +275,125 @@ run_deploy() {
 }
 
 # ---------------------------------------------------------------------------
+# MODE: publish-run — validate the run JSON and hand its path to the publish
+# step in action.yml, which commits it to the runs branch via the Git Data API.
+# No binary needed: the raw run JSON is published as-is (it is what the
+# executable-stories-astro loader consumes).
+# ---------------------------------------------------------------------------
+run_publish() {
+  local SOURCE="${RUN_JSON:-}"
+  [[ -z "$SOURCE" ]] && SOURCE="$RAW_RUN"
+  if [[ ! -f "$SOURCE" ]]; then
+    echo "::error::publish-run mode needs a run JSON. Looked for '${SOURCE}'."
+    echo "::error::Set run-json (or raw-run) to your test run output. JS reporters can emit raw-run.json; non-JS adapters write .executable-stories/raw-run.json."
+    exit 1
+  fi
+  # Gate on the file actually being a run JSON. Validate the structural fields
+  # the raw -> canonical transform dereferences so a payload accepted here
+  # cannot later crash an executable-stories-astro loader. This deliberately
+  # accepts both permissive raw runs and strict canonical runs; it is not a
+  # second versioned schema. Node is available on every Actions runner that can
+  # execute this composite action, so validation has no optional dependency or
+  # bypass path.
+  if ! node -e '
+    const fs = require("fs");
+    const d = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const record = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+    const strings = (v) => Array.isArray(v) && v.every((item) => typeof item === "string");
+    const optionalStrings = (v) => v === undefined || strings(v);
+    const validStep = (step) => record(step) && typeof step.keyword === "string" && typeof step.text === "string";
+    const validTicket = (ticket) =>
+      typeof ticket === "string" || (record(ticket) && typeof ticket.id === "string");
+    const validAttachment = (attachment) =>
+      record(attachment) &&
+      typeof attachment.name === "string" &&
+      typeof attachment.mediaType === "string" &&
+      (attachment.path === undefined || typeof attachment.path === "string") &&
+      (attachment.body === undefined || typeof attachment.body === "string");
+    const validStory = (story) =>
+      story === undefined ||
+      (record(story) &&
+        (story.scenario === undefined || typeof story.scenario === "string") &&
+        (story.steps === undefined || (Array.isArray(story.steps) && story.steps.every(validStep))) &&
+        optionalStrings(story.tags) &&
+        optionalStrings(story.suitePath) &&
+        (story.tickets === undefined || (Array.isArray(story.tickets) && story.tickets.every(validTicket))));
+    const validCase = (testCase) =>
+      record(testCase) &&
+      typeof testCase.status === "string" &&
+      validStory(testCase.story) &&
+      optionalStrings(testCase.titlePath) &&
+      (testCase.attachments === undefined ||
+        (Array.isArray(testCase.attachments) && testCase.attachments.every(validAttachment))) &&
+      (testCase.stepEvents === undefined ||
+        (Array.isArray(testCase.stepEvents) && testCase.stepEvents.every(record)));
+    if (!record(d) || !Array.isArray(d.testCases) || !d.testCases.every(validCase)) process.exit(1);
+  ' "$SOURCE" >/dev/null 2>&1; then
+    echo "::error::publish-run: '${SOURCE}' is not a structurally valid raw/canonical run JSON."
+    echo "::error::Refusing to publish — downstream docs hubs fetch this file at build time."
+    exit 1
+  fi
+  echo "::notice::Publishing ${SOURCE} to the runs branch..."
+  echo "publish-source=${SOURCE}" >> "$GITHUB_OUTPUT"
+}
+
+# ---------------------------------------------------------------------------
+# MODE: ingest — push the run's StoryReport to a cloud ingest endpoint.
+# The free action stays file-based and stateless; this mode only runs when an
+# api-key is provided (the open-core line: persistence lives in the cloud).
+# ---------------------------------------------------------------------------
+run_ingest() {
+  if [[ -z "${API_KEY:-}" ]]; then
+    echo "::error::ingest mode needs api-key. Create one in your cloud instance's settings (Ingest key) and store it as a secret."
+    exit 1
+  fi
+
+  resolve_binary
+
+  # Use a pre-generated StoryReport if present; otherwise format the raw run.
+  local STORY_REPORT="${REPORT_DIR}/${OUTPUT_NAME}.story-report.json"
+  if [[ ! -f "$STORY_REPORT" ]]; then
+    if [[ ! -f "$RAW_RUN" ]]; then
+      echo "::error::ingest mode needs ${STORY_REPORT} or a raw run JSON at ${RAW_RUN}."
+      exit 1
+    fi
+    mkdir -p "$REPORT_DIR"
+    "$BINARY_PATH" format "$RAW_RUN" \
+      --format story-report-json \
+      --output-dir "$REPORT_DIR" \
+      --output-name "$OUTPUT_NAME"
+    if [[ ! -f "$STORY_REPORT" ]]; then
+      echo "::error::Formatter ran but ${STORY_REPORT} was not produced."
+      exit 1
+    fi
+  fi
+
+  # The CLI owns the wire contract: it reads repo/branch/sha, the base commit,
+  # and PR metadata from the Actions environment, writes the run URL and the
+  # recommended scope to the job summary, and appends ingest-run-id to
+  # GITHUB_OUTPUT. Duplicating any of that here is how the two drift apart.
+  local PUSH_ARGS=(push "$STORY_REPORT" --url "$INGEST_URL")
+  [[ "${INGEST_GATE:-}" == "true" ]] && PUSH_ARGS+=(--gate)
+
+  # Capture the exit code explicitly: the gate reports its verdict with a
+  # distinct code, and `set -e` would kill the step before we can name it.
+  set +e
+  EXECUTABLE_STORIES_API_KEY="$API_KEY" "$BINARY_PATH" "${PUSH_ARGS[@]}"
+  local STATUS=$?
+  set -e
+
+  case "$STATUS" in
+    0) echo "::notice::Run ingested to ${INGEST_URL}" ;;
+    5) echo "::error::Release gate blocked this commit — see the job summary for the reasons."
+       exit 1 ;;
+    4) echo "::error::The formatter binary rejected these options. formatter-version is pinned to '${FORMATTER_VERSION}', which predates them — use 'latest' or a newer version."
+       exit 1 ;;
+    *) echo "::error::Ingest failed — check api-key, ingest-url, and that the cloud instance is reachable."
+       exit 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # Main dispatch
 #
 # Living-docs sites are no longer built here. They come from a committed Astro
@@ -295,8 +414,14 @@ case "$MODE" in
   deploy)
     run_deploy
     ;;
+  publish-run)
+    run_publish
+    ;;
+  ingest)
+    run_ingest
+    ;;
   *)
-    echo "::error::Unknown mode: ${MODE}. Supported: report, review, gate-release, deploy."
+    echo "::error::Unknown mode: ${MODE}. Supported: report, review, gate-release, deploy, publish-run, ingest."
     echo "::error::For a living-docs site, scaffold with 'executable-stories init-astro' and deploy with 'astro build' (see the action README)."
     exit 1
     ;;
