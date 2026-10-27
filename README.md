@@ -4,7 +4,7 @@ Surface [executable-stories](https://github.com/jagreehal/executable-stories) te
 
 Works with all supported frameworks — zero configuration for the common case.
 
-> **Looking for the user-friendly docs?** See [executablestories.com/guides/github-action](https://executablestories.com/guides/github-action/).
+> **Looking for the user-friendly docs?** See [docs.executablestories.com/guides/github-action](https://docs.executablestories.com/guides/github-action/).
 
 ## Contents
 
@@ -38,20 +38,7 @@ The action auto-detects your test output. No inputs are required for the default
 
 ## Prerequisites
 
-The action does **not** run your tests — it surfaces the output of an `executable-stories` reporter that has already run. You need one of these set up first:
-
-| Framework | Setup guide |
-|---|---|
-| Vitest | [Installation (Vitest)](https://executablestories.com/getting-started/installation-vitest/) |
-| Jest | [Installation (Jest)](https://executablestories.com/getting-started/installation-jest/) |
-| Playwright | [Installation (Playwright)](https://executablestories.com/getting-started/installation-playwright/) |
-| Cypress | [Installation (Cypress)](https://executablestories.com/getting-started/installation-cypress/) |
-| pytest | [Installation (pytest)](https://executablestories.com/getting-started/installation-pytest/) |
-| Go | [Installation (Go)](https://executablestories.com/getting-started/installation-go/) |
-| Rust | [Installation (Rust)](https://executablestories.com/getting-started/installation-rust/) |
-| Ruby (Minitest) | [Installation (Ruby)](https://executablestories.com/getting-started/installation-ruby/) |
-| JUnit 5 (Kotlin) | [Installation (JUnit 5)](https://executablestories.com/getting-started/installation-junit5/) |
-| xUnit (C#) | [Installation (xUnit)](https://executablestories.com/getting-started/installation-xunit/) |
+The action does **not** run your tests. It surfaces the output of an `executable-stories` reporter that has already run, so set up an adapter first: [Install](https://docs.executablestories.com/getting-started/install/) covers Vitest, Jest, Playwright, Cypress, Go, Python, Ruby, Rust, Kotlin, and C#.
 
 If your test command does not produce **either** `reports/test-results.{html,md}` **or** `.executable-stories/raw-run.json`, the action has nothing to surface and will fail with a "no reports found" error. See [Troubleshooting](#troubleshooting).
 
@@ -65,7 +52,9 @@ The action checks for test output in two places, in order:
 In both cases the action then:
 
 - Uploads `test-results.html` as a workflow artifact
-- Posts (or updates) a PR comment containing the markdown summary
+- Posts (or updates) a PR comment that leads with a verdict and a ranked list of findings
+- Annotates the changed files in the diff, so findings appear next to the code
+- Writes the same summary to the job summary, so a push or scheduled build is not silent
 - Sets outputs you can chain to subsequent steps
 
 ## Examples by framework
@@ -294,9 +283,14 @@ The `hashFiles(...)` guards skip the action when a test suite produced no output
 
 ### Render screenshots inline in PR comments (opt-in)
 
-By default, screenshots referenced in your stories stay in the HTML artifact only — the PR comment shows a `📎 alt (see HTML report)` placeholder. This is because GitHub blocks `data:` URIs in comment markdown for security, so even a well-formed `![alt](data:image/png;base64,…)` would not render inline.
+By default, media referenced in your stories stays in the HTML artifact and the comment shows a `📎 alt (see HTML report)` label. A comment cannot fetch either shape your run produces:
 
-To make screenshots render inline in the PR comment, opt in:
+| In the markdown | Where it comes from | Why a comment cannot show it |
+| --- | --- | --- |
+| `![alt](data:image/png;base64,…)` | a reporter inlining the bytes | GitHub blocks `data:` URIs in comment markdown |
+| `![alt](assets/dashboard.png)` | `--asset-mode copy`, and Playwright's colocated reports | GitHub resolves relative image paths in a repository file, never in a comment |
+
+A label is honest where a broken image icon is not, which is why that is the default. To make them render inline instead, opt in:
 
 ```yaml
 permissions:
@@ -315,12 +309,22 @@ jobs:
 
 What this does:
 
-- Per PR run, the action commits each screenshot to an orphan branch (`executable-stories-images` by default) under `pr-{number}/{run-id}/`
-- The PR comment is rewritten to use `https://raw.githubusercontent.com/...` URLs so images render inline
+- Per PR run, the action commits each screenshot and video to an orphan branch (`executable-stories-images` by default) under `pr-{number}/{run-id}/`. Both shapes above are covered, and the same file referenced twice uploads once
+- The PR comment is rewritten to `https://raw.githubusercontent.com/...` URLs, so screenshots render inline
 - The branch is created automatically on first use, with a small README explaining what it is. Old `pr-*/` directories are safe to delete at any time
-- If the upload fails (e.g. `contents: write` not granted, or a concurrent run races on the ref), the action falls back to placeholder mode and posts a warning. The comment still renders cleanly.
+- If the upload fails (e.g. `contents: write` not granted, or a concurrent run races on the ref), the action falls back to labels and posts a warning. The comment still renders cleanly.
 
-> **Concurrency note.** The action commits using the GitHub Git Data API by referencing the branch's current tip as the parent. If two PR runs touch the same `images-branch` simultaneously, the second `updateRef` call will fail with a non-fast-forward error and the action will fall back to placeholders for that run. There's no retry yet — see [executable-stories-action#1](https://github.com/jagreehal/executable-stories-action/pull/1) for context. For most repos this is rare; if you regularly run many parallel PRs and need bullet-proof inline images, consider giving each workflow a different `images-branch`.
+Limits, each announced in a warning rather than failing the run — what fits is hosted, the rest stays in the HTML report:
+
+| Limit | Why |
+| --- | --- |
+| 10 MB per file | A PR comment is not the place for a full session recording. |
+| 50 files and 50 MB per run | Every asset costs one API call, and `GITHUB_TOKEN` gets roughly a thousand an hour per repo. A three-hundred-frame storyboard would otherwise spend the job's whole budget on screenshots and then fail the calls that post the comment. |
+| Nothing outside the workspace | Report content is not trusted input — on a fork PR the paths in it come from a contributor's code, and hosting is a publish. `![x](../../../etc/passwd)` is dropped rather than committed to a public branch. |
+
+**Videos become a link, never a player.** `<video>` is not in GitHub's comment HTML allowlist, so the tag renders as nothing at all — the one asset shape that fails silently. The action rewrites it to `▶️ Watch the recording` pointing at the hosted file, or to a `▶️ Video (see HTML report)` label when it is not hosted. A real inline player needs the media uploaded through `user-attachments`, which only `gh pr comment --attach` can do — not the API this action posts through.
+
+> **Concurrency note.** The action commits using the GitHub Git Data API with the branch's current tip as the parent. When two PR runs push to the same `images-branch` at once, the loser re-reads the tip and retries (up to 3 attempts). The PR comment is only written if the run tested the PR's current head, checked immediately before the write. GitHub has no conditional comment write, so one API round trip remains in which an older run can still land last. To rule that out, serialize the workflow per PR with `concurrency: { group: ${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: false }`.
 
 ### Custom output paths
 
@@ -399,34 +403,6 @@ Append a deployment to an environment ledger so later runs (and `gate-release`) 
 
 Persist the ledger (artifact, cache, or committed file) if later jobs should compare environments. The written path is exposed as `deploy-ledger-path`.
 
-### Living documentation — a deployable docs site
-
-A living-docs site is no longer a mode of this action. It comes from a committed Astro project, so the site is a normal part of your repo you can theme, extend with hand-written guides, and deploy with any static host.
-
-Scaffold it once:
-
-```bash
-npx --package executable-stories-formatters executable-stories init-astro docs-site
-```
-
-Commit `docs-site/` and point its `executable-stories.config.mjs` at the reporter's per-source directory (`reports/by-file` by default). Then build and deploy it from your own workflow. A full CI run refreshes that directory before the site build; a raw-run source is appropriate only when it is deliberately a complete run snapshot:
-
-```yaml
-jobs:
-  docs:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: pnpm install
-      - run: pnpm test                 # writes reports/raw-run.json
-      - run: pnpm --filter docs-site build   # astro build → docs-site/dist
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: docs-site/dist
-```
-
-See the [Astro docs-site guide](https://github.com/jagreehal/executable-stories/blob/main/apps/docs-site/src/content/docs/guides/astro-docs-site.md) for theming, audience grouping, and the "What's changed" view.
-
 ### Publish run JSON for a multi-repo docs hub (`mode: publish-run`)
 
 To collate stories from many repositories into one docs site, each repo publishes its run JSON to an orphan branch with a stable path. A hub repo then fetches each file by URL at build time — no cross-repo artifact APIs, no artifact expiry, no extra tokens for public repos.
@@ -459,7 +435,7 @@ canonical transform. A late older job cannot overwrite a run with a newer
 inlined by GitHub's Contents API. If one repo has several suites, publish each
 under its own `runs-path`.
 
-In the hub repo, fetch the files and build the Astro site (see the [multi-repo docs hub guide](https://github.com/jagreehal/executable-stories/blob/main/apps/docs-site/src/content/docs/guides/multi-repo-docs-hub.md)):
+In the hub repo, fetch the files and build the site:
 
 ```yaml
 steps:
@@ -469,7 +445,7 @@ steps:
       mkdir -p reports
       curl -fsSL -o reports/web.json https://raw.githubusercontent.com/acme/web/executable-stories-runs/raw-run.json
       curl -fsSL -o reports/api.json https://raw.githubusercontent.com/acme/api/executable-stories-runs/raw-run.json
-  - run: pnpm install && pnpm build   # astro build reads reports/*.json via sources: [...]
+  - run: pnpm install && pnpm build   # the site build reads reports/*.json
 ```
 
 > **Concurrency note.** Like `host-images: branch`, publishing uses the Git Data API with the branch tip as parent, so two simultaneous runs publishing to the same branch race at `updateRef`. The loser automatically retries on the new tip (up to 3 attempts), which resolves the common overlap. If your repo runs many parallel publishers, serialize the workflow with [`concurrency`](https://docs.github.com/en/actions/using-jobs/using-concurrency) or use per-suite `runs-path` values.
@@ -483,15 +459,16 @@ steps:
 | `output-name` | `test-results` | Base filename for reports (without extension) |
 | `raw-run` | `.executable-stories/raw-run.json` | Path to raw run JSON |
 | `formatter-version` | `latest` | Version of `executable-stories` binary (`latest` or semver, e.g. `0.7.12`) |
-| `artifact-name` | `executable-stories-report` | Name for the uploaded GitHub artifact |
+| `artifact-name` | `executable-stories-report` | Name for the uploaded GitHub artifact. Carries the HTML report and its `assets/` directory, so referenced screenshots and videos open. |
 | `comment-title` | `Executable Stories` | Header text for the PR comment; also used as the marker that lets the action find and update its own comment on subsequent runs |
-| `host-images` | `false` | Set to `branch` to commit screenshots to an orphan branch and render them inline in the PR comment. Requires `contents: write`. See [Render screenshots inline](#render-screenshots-inline-in-pr-comments-opt-in). |
-| `images-branch` | `executable-stories-images` | Branch used when `host-images: branch`. Created as orphan on first use. |
+| `host-images` | `false` | Set to `branch` to commit screenshots and videos to an orphan branch, so screenshots render inline in the PR comment and videos become a link. Requires `contents: write`. See [Render screenshots inline](#render-screenshots-inline-in-pr-comments-opt-in). |
+| `images-branch` | `executable-stories-images` | Branch used when `host-images: branch`. Holds screenshots and videos. Created as orphan on first use. |
 | `run-json` | — | (review) Path to the run JSON to correlate against the PR diff. Defaults to `raw-run` |
 | `base-ref` | — | (review) Base ref to diff against. Defaults to the PR base branch |
 | `changed-files` | — | (review) Optional precomputed changed-files file. If unset, computed from git |
 | `fail-on` | — | (review) Opt-in gate: `uncovered` or `weak` — fail when changed code lacks evidence |
 | `min-evidence` | — | (review) Opt-in gate: `weak`, `moderate`, or `strong` — fail when claims are below this strength |
+| `baseline-run` | — | (review) Base branch run JSON. Scenarios removed, newly skipped, or making fewer steps or assertions than on it become `weakened` findings |
 | `formatter-binary` | — | Path to a prebuilt `executable-stories` binary instead of downloading from Releases |
 | `gate-dev-run` | — | (gate-release) Path to the dev test run used as the baseline |
 | `gate-fail-on-regression` | `true` | (gate-release) Fail if scenarios regressed from dev to the RC |
@@ -505,7 +482,8 @@ steps:
 | `runs-path` | `raw-run.json` | (publish-run) Path of the published file within `runs-branch` |
 | `api-key` | — | (ingest) Cloud ingest API key (`es_…`). Store as a secret |
 | `ingest-url` | `https://app.executablestories.com` | (ingest) Cloud instance to push runs to |
-| `ingest-gate` | `false` | (ingest) Fail the step when the cloud's release gate blocks this commit. The run URL and recommended scope are written to the job summary either way |
+| `ingest-gate` | `false` | (ingest) Fail the step when the cloud's release gate blocks this commit. On a pull request the blocking reasons are posted as the PR comment, and annotated on the Checks tab, before the step fails. With the gate off, the comment still headlines the run's own outcome. A commit with no release recorded reports *"the release gate was not evaluated"* — never a clear verdict, because nothing was checked |
+| `cloud-links` | `false` | Link the run in Executable Stories Cloud from the PR comment. Off until the cloud is generally available; the comment links the workflow run instead. Nothing else about `ingest` depends on it |
 
 ## Outputs
 
@@ -536,17 +514,110 @@ permissions:
   contents: write
 ```
 
+A permission belongs to the whole job, not just the action's step. Your test step runs the pull request's code and every dependency's install script, and with `contents: write` on the job a compromised package can push to your branches. To keep write access away from that code, run the tests in one job and the action in another:
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      # ...install and run tests...
+      - uses: actions/upload-artifact@v7
+        with:
+          name: stories
+          path: reports/
+
+  report:
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write # only if you use host-images: branch
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: stories
+          path: reports/
+      - uses: jagreehal/executable-stories-action@v2
+        with:
+          host-images: branch
+```
+
+The `report` job runs no code from the pull request: it reads the files the tests wrote. Upload every folder the report points at, e.g. Playwright's `test-results/` when screenshots live there. `mode: review` also reads the diff, so add an `actions/checkout` with `fetch-depth: 0` to that job; it still runs nothing from the PR.
+
 For PRs from forks, GitHub restricts the default `GITHUB_TOKEN` to read-only — see [FAQ](#faq) for workarounds.
 
 ## What you see in PRs
 
+The comment answers "can I merge this?" before you expand anything:
+
+```
+## Executable Stories
+
+**Merge risk: 🔴 High** · 1 scenario failed, 2 changed files ship with no evidence
+
+❌ 1 failed · 🔴 2 uncovered · 🟠 1 weak · 🟢 4 covered · ✅ 11/12 scenarios passed
+
+### Findings (4)
+
+▸ ❌ Unproven claim: Checkout blocks a suspended user — src/cart/checkout.e2e.test.ts:12
+▸ 🔴 Changed with no evidence — src/cart/discount.ts
+▸ 🟡 Weak evidence only — src/cart/totals.ts
+
+▸ 🤖 Prompt for AI agents
+▸ 📖 Full report
+```
+
 Each invocation produces:
 
-- A collapsible section in a PR comment containing the full Markdown story output
-- A link at the bottom of that comment to download the interactive HTML report from the workflow's artifacts
-- (Optional, with `host-images: branch`) Screenshots rendered inline in the comment
+- **A verdict line.** `Merge risk` is graded on the worst finding, not the count: one red
+  scenario outranks ten weakly evidenced files, because a red scenario is a claim the change
+  does not honour. Grades are High / Moderate / Low / Clear.
+- **A counts strip** — failed, unasserted, uncovered, weak, covered, and how many scenarios
+  passed. Zeroes are omitted.
+- **Ranked findings**, worst first, each collapsible and each carrying **How this was verified**
+  so a reader can check the claim rather than take it. Four kinds:
 
-On subsequent pushes to the same PR, the comment is **updated in place** rather than duplicated. Comments are matched by an HTML marker (`<!-- executable-stories: ${comment-title} -->`), so the same `comment-title` always updates the same comment, while different titles produce different comments (see [Multiple reports per PR](#multiple-reports-per-pr)).
+  | Finding | Severity | What it means |
+  | --- | --- | --- |
+  | `failed` | Blocker | A scenario states a claim about the change and does not pass. |
+  | `unasserted` | Major | A scenario passed without asserting anything, so it cannot fail and proves nothing. Worse than a missing test, because it reads as proof. |
+  | `uncovered` | Major | A changed source file has no claim behind it at all. |
+  | `skipped` | Minor | A scenario did not run, so its claim is unproven. Deliberately the mildest kind — otherwise every `it.skip` blocks a merge. |
+  | `weak` | Minor | A changed file's only claims are weakly evidenced. |
+  | `policy` | Blocker or Minor | An organisation release policy this commit does not satisfy. Decided by Executable Stories Cloud rather than by this run, so it is the one kind with no file to anchor to. |
+
+  `uncovered`, `weak` and `skipped` need `mode: review`, which correlates the run to the PR
+  diff. `policy` comes from `mode: ingest` with `ingest-gate: true`. Everything else works in
+  the default `report` mode.
+- **A "Prompt for AI agents" block** you can paste straight into a coding agent. It opens by
+  naming its own contents as untrusted data, because scenario titles and error messages are
+  attacker-influenced in any repo that takes contributions.
+- **Inline annotations** on the changed files — blockers as errors, majors as warnings, minors
+  as notices — so findings show up in the Files changed tab.
+- **A job summary** carrying the same content, so runs with no PR still report.
+- The full Markdown story output, collapsed, and a link to the HTML artifact. The artifact
+  carries the report's `assets/` directory alongside the HTML, so the screenshots and videos
+  a `📎` label points at actually open.
+- (Optional, with `host-images: branch`) Screenshots rendered inline in the comment, and
+  videos as a link. See [Render screenshots inline](#render-screenshots-inline-in-pr-comments-opt-in).
+
+`mode: review` also writes `reports/<output-name>.review.json` — the machine contract behind
+all of the above (ranked findings, evidence bands, per-claim strength). Read that rather than
+scraping the comment if you are building on top of it.
+
+On subsequent pushes to the same PR, the comment is **updated in place** rather than duplicated,
+and an unchanged body is skipped entirely rather than re-posted.
+
+Each invocation is independent. A workflow may use this action more than once (see
+[Multiple reports per PR](#multiple-reports-per-pr)), and every file the action passes
+between its own steps is cleared at the start of each invocation — so a second suite can
+never render the first suite's screenshots, verdict, or comment body. Both suites
+conventionally reference `assets/…`, so without that the swap would be silent. Comments are matched by an HTML marker (`<!-- executable-stories: ${comment-title} -->`), so the same `comment-title` always updates the same comment, while different titles produce different comments (see [Multiple reports per PR](#multiple-reports-per-pr)).
 
 ## Troubleshooting
 
@@ -564,16 +635,20 @@ The action's first step says it could not find pre-generated reports or a raw ru
 - Confirm the action ran on a `pull_request` event (not a `push` to a branch — the action only comments on PRs).
 - For PRs from forks, the default `GITHUB_TOKEN` is read-only by design; the action will silently skip the comment step. See [FAQ](#faq).
 
-### Screenshots show as 📎 placeholders, not images
+### Screenshots show as 📎 labels, not images
 
-This is the default. GitHub blocks `data:` URIs in comment markdown, so inline base64 images would not render even if we left them in. Opt in to [host-images: branch](#render-screenshots-inline-in-pr-comments-opt-in) to render them inline.
+This is the default, and it applies to both an inlined `data:` URI and a relative `assets/…` path — a comment can fetch neither, so a label is shown instead of a broken image. Opt in to [host-images: branch](#render-screenshots-inline-in-pr-comments-opt-in) to render them inline. The media is in the HTML artifact either way.
 
-### `host-images: branch` warned and fell back to placeholders
+A video is labelled `▶️ Video (see HTML report)` rather than shown, even with hosting on: see [Render screenshots inline](#render-screenshots-inline-in-pr-comments-opt-in).
 
-Two known causes:
+### `host-images: branch` warned and fell back to labels
+
+Four known causes. The first two fail the whole step; the last two skip one file and say which:
 
 1. **Missing `contents: write` permission.** Add it to the workflow permissions block.
-2. **Concurrent run race.** Two simultaneous workflows tried to push to the same `images-branch` and the second `updateRef` lost the race. There is no retry currently. Workaround: serialize PR runs (e.g. `concurrency: group: ${{ github.ref }}`), or use a per-workflow `images-branch`.
+2. **Concurrent run race.** More than three simultaneous workflows pushed to the same `images-branch` and this run lost every retry. Serialize PR runs (e.g. `concurrency: group: ${{ github.ref }}`), or use a per-workflow `images-branch`.
+3. **`Skipping '…' — N MB exceeds the 10 MB hosting limit.`** The file stays in the HTML report.
+4. **`Refusing to host '…' — it resolves outside the workspace.`** A reference escaped the checkout. This is deliberate: report content is not trusted input, and hosting publishes bytes to a branch.
 
 ### `Schema validation failed` from the formatter binary
 
@@ -581,7 +656,16 @@ Your raw-run JSON was produced by an older adapter than the formatter expects. E
 
 ### Comment is showing partial markdown / "Report truncated"
 
-GitHub caps comments at ~65 KB. The action truncates at the last newline before 55 KB and adds a "Report truncated" note. The full content is in the HTML artifact. If you see this routinely, consider splitting suites with [Multiple reports per PR](#multiple-reports-per-pr).
+GitHub caps comments at ~65 KB, and refuses a comment over it outright. The verdict is written
+first and always survives. Findings get a fixed budget and are rendered worst-first, so what
+you see is what to read first; the heading says how many were shown out of how many
+(`Findings (200, showing the 47 most severe)`) and a line names the rest. The full report gets
+whatever budget is left, is cut at a newline, and any block the cut lands inside is closed so
+the footer still renders.
+
+The complete set is always in `<output-name>.review.json` and the HTML artifact. If you see
+this routinely, consider splitting suites with
+[Multiple reports per PR](#multiple-reports-per-pr).
 
 ## FAQ
 

@@ -136,10 +136,22 @@ run_review() {
 
   mkdir -p "$REPORT_DIR"
 
+  # Same rule as ingest: the comment builder reads this path in review mode, and
+  # a formatter pinned to a version that predates it would leave whatever was
+  # there before to be rendered as this run's review.
+  rm -f "${REPORT_DIR}/${OUTPUT_NAME}.review.json"
+
   # Build optional gate flags
   local GATE_ARGS=()
   [[ -n "${FAIL_ON:-}" ]] && GATE_ARGS+=(--fail-on "$FAIL_ON")
   [[ -n "${MIN_EVIDENCE:-}" ]] && GATE_ARGS+=(--min-evidence "$MIN_EVIDENCE")
+  if [[ -n "${BASELINE_RUN:-}" ]]; then
+    if [[ -f "$BASELINE_RUN" ]]; then
+      GATE_ARGS+=(--baseline "$BASELINE_RUN")
+    else
+      echo "::warning::baseline-run '${BASELINE_RUN}' not found; reviewing without a baseline."
+    fi
+  fi
 
   # The review report is written before any gate is evaluated, so even when the
   # gate fails (exit 5) the report exists for the comment/artifact steps. We
@@ -155,7 +167,7 @@ run_review() {
   set -e
 
   if [[ "$CODE" -eq 5 ]]; then
-    echo "gate-failed=true" >> "$GITHUB_OUTPUT"
+    echo "gate-failed=true" >> "${GITHUB_OUTPUT:-/dev/null}"
     echo "::warning::Evidence Review gate failed; report generated, gate enforced after comment."
   elif [[ "$CODE" -ne 0 ]]; then
     echo "::error::review failed with exit code ${CODE}"
@@ -225,13 +237,13 @@ run_gate_release() {
   echo "::endgroup::"
 
   if [[ $EXIT_CODE -eq 6 ]]; then
-    echo "gate-failed=true" >> "$GITHUB_OUTPUT"
+    echo "gate-failed=true" >> "${GITHUB_OUTPUT:-/dev/null}"
     echo "::error::Release gate failed. RC does not match dev baseline."
   elif [[ $EXIT_CODE -ne 0 ]]; then
     echo "::error::gate-release command failed with exit code ${EXIT_CODE}"
     exit $EXIT_CODE
   else
-    echo "gate-failed=false" >> "$GITHUB_OUTPUT"
+    echo "gate-failed=false" >> "${GITHUB_OUTPUT:-/dev/null}"
     echo "::notice::Release gate passed. RC matches dev baseline."
   fi
 }
@@ -265,7 +277,7 @@ run_deploy() {
   echo "::endgroup::"
 
   echo "::notice::Deployment to ${ENV} recorded in ${LEDGER}"
-  echo "deploy-ledger-path=${LEDGER}" >> "$GITHUB_OUTPUT"
+  echo "deploy-ledger-path=${LEDGER}" >> "${GITHUB_OUTPUT:-/dev/null}"
   echo "::notice::Persist ${LEDGER} as an artifact, cache, or committed file if later jobs should compare environments."
 
   # Also show current status
@@ -277,8 +289,7 @@ run_deploy() {
 # ---------------------------------------------------------------------------
 # MODE: publish-run — validate the run JSON and hand its path to the publish
 # step in action.yml, which commits it to the runs branch via the Git Data API.
-# No binary needed: the raw run JSON is published as-is (it is what the
-# executable-stories-astro loader consumes).
+# No binary needed: the raw run JSON is published as-is.
 # ---------------------------------------------------------------------------
 run_publish() {
   local SOURCE="${RUN_JSON:-}"
@@ -290,7 +301,7 @@ run_publish() {
   fi
   # Gate on the file actually being a run JSON. Validate the structural fields
   # the raw -> canonical transform dereferences so a payload accepted here
-  # cannot later crash an executable-stories-astro loader. This deliberately
+  # cannot later crash a downstream loader. This deliberately
   # accepts both permissive raw runs and strict canonical runs; it is not a
   # second versioned schema. Node is available on every Actions runner that can
   # execute this composite action, so validation has no optional dependency or
@@ -334,7 +345,7 @@ run_publish() {
     exit 1
   fi
   echo "::notice::Publishing ${SOURCE} to the runs branch..."
-  echo "publish-source=${SOURCE}" >> "$GITHUB_OUTPUT"
+  echo "publish-source=${SOURCE}" >> "${GITHUB_OUTPUT:-/dev/null}"
 }
 
 # ---------------------------------------------------------------------------
@@ -372,7 +383,22 @@ run_ingest() {
   # and PR metadata from the Actions environment, writes the run URL and the
   # recommended scope to the job summary, and appends ingest-run-id to
   # GITHUB_OUTPUT. Duplicating any of that here is how the two drift apart.
-  local PUSH_ARGS=(push "$STORY_REPORT" --url "$INGEST_URL")
+  # The gate verdict is written as a ReviewJson so the comment step renders the
+  # org's blocking reasons the same way it renders a local Evidence Review.
+  # Without it those reasons only ever reached the job log, and the paid path
+  # had worse PR feedback than the free one.
+  local REVIEW_OUT="${REPORT_DIR}/${OUTPUT_NAME}.review.json"
+  # Cleared whether or not a gate runs. The comment builder reads this path in
+  # ingest mode, so anything left here by an earlier `review` invocation — or
+  # committed into the repo — would be presented as this run's policy verdict.
+  # A stale verdict is worse than no verdict.
+  rm -f "$REVIEW_OUT"
+
+  # --review-json is passed with or without a gate. It carries the cloud run URL
+  # and this run's outcome counts, which is what the PR comment needs in the
+  # default configuration; without it the comment has no run to link to and
+  # falls back to advertising an HTML artifact ingest mode never uploads.
+  local PUSH_ARGS=(push "$STORY_REPORT" --url "$INGEST_URL" --review-json "$REVIEW_OUT")
   [[ "${INGEST_GATE:-}" == "true" ]] && PUSH_ARGS+=(--gate)
 
   # Capture the exit code explicitly: the gate reports its verdict with a
@@ -384,8 +410,11 @@ run_ingest() {
 
   case "$STATUS" in
     0) echo "::notice::Run ingested to ${INGEST_URL}" ;;
-    5) echo "::error::Release gate blocked this commit — see the job summary for the reasons."
-       exit 1 ;;
+    # Recorded, not raised: the comment step runs next and is how a developer
+    # finds out *why* they were blocked. "Enforce ingest gate" fails the job
+    # afterwards, mirroring review and gate-release.
+    5) echo "gate-failed=true" >> "${GITHUB_OUTPUT:-/dev/null}"
+       echo "::warning::Release policy blocked this commit; the gate is enforced after the PR comment." ;;
     4) echo "::error::The formatter binary rejected these options. formatter-version is pinned to '${FORMATTER_VERSION}', which predates them — use 'latest' or a newer version."
        exit 1 ;;
     *) echo "::error::Ingest failed — check api-key, ingest-url, and that the cloud instance is reachable."
@@ -395,11 +424,6 @@ run_ingest() {
 
 # ---------------------------------------------------------------------------
 # Main dispatch
-#
-# Living-docs sites are no longer built here. They come from a committed Astro
-# project: scaffold once with `executable-stories init-astro`, point it at your
-# run JSON, and deploy with `astro build` in your own workflow. See the
-# "Living documentation" section of the README.
 # ---------------------------------------------------------------------------
 case "$MODE" in
   report)
@@ -422,7 +446,6 @@ case "$MODE" in
     ;;
   *)
     echo "::error::Unknown mode: ${MODE}. Supported: report, review, gate-release, deploy, publish-run, ingest."
-    echo "::error::For a living-docs site, scaffold with 'executable-stories init-astro' and deploy with 'astro build' (see the action README)."
     exit 1
     ;;
 esac
